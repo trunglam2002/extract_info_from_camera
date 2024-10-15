@@ -3,124 +3,158 @@ from deepface import DeepFace
 import pandas as pd
 from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
+import threading
+import queue
 
-backends = [
-    'opencv',
-    'ssd',
-    'dlib',
-    'mtcnn',
-    'fastmtcnn',
-    'retinaface',
-    'mediapipe',
-    'yolov8',
-    'yunet',
-    'centerface',
-]
-
+# Define the backend and MongoDB connection
+backends = ['opencv', 'ssd', 'dlib', 'mtcnn', 'fastmtcnn',
+            'retinaface', 'mediapipe', 'yolov8', 'yunet', 'centerface']
 backend = backends[7]
 alignment_modes = [True, False]
 
-# Kết nối MongoDB Atlas
 uri = "mongodb+srv://nguyentrunglam2002:lampro3006@userdata.av8zp.mongodb.net/?retryWrites=true&w=majority&appName=UserData"
 client = MongoClient(uri, server_api=ServerApi('1'))
-db = client["banking"]  # Cơ sở dữ liệu MongoDB
-collection = db["user_info"]  # Collection MongoDB
+db = client["banking"]
+collection = db["user_info"]
+
+# Function to draw bounding box and display information on the face
 
 
-# Hàm vẽ hình chữ nhật và hiển thị tên, thông tin, cảm xúc trên khuôn mặt
 def draw_bounding_box(frame, x, y, w, h, text):
     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
     cv2.putText(frame, text, (x, y - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
 
 
-# Đọc video đầu vào
-video_path = "Obama_vid.mp4"
-cap = cv2.VideoCapture(video_path)
+# Initialize queues for inter-thread communication
+frame_queue = queue.Queue()
+result_queue = queue.Queue()
 
-# Lấy thông tin về chiều rộng, chiều cao và FPS của video
-frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps = int(cap.get(cv2.CAP_PROP_FPS))
+# Thread for reading video frames
 
-# Tạo đối tượng VideoWriter để ghi video đầu ra
-output_path = "output_with_info.mp4"
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
-# Ngưỡng khoảng cách để xác định người, ví dụ 0.6
-distance_threshold = 0.6
+def frame_reader(video_path):
+    cap = cv2.VideoCapture(video_path)
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_queue.put(frame)
+    cap.release()
+    frame_queue.put(None)  # Indicate end of video
 
-# Đường dẫn đến cơ sở dữ liệu khuôn mặt
-db_path = "test/my_db"
+# Thread for analyzing faces
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
 
-    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+def face_analyzer():
+    while True:
+        frame = frame_queue.get()
+        if frame is None:  # Check for end of video
+            result_queue.put((None, None))
+            break
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        detected_faces = DeepFace.extract_faces(
+            img_rgb, enforce_detection=False, detector_backend=backend)
+        if detected_faces:
+            results = []
+            for detected_face in detected_faces:
+                face_image = detected_face['face']
+                emotions = DeepFace.analyze(face_image, actions=[
+                                            'emotion'], enforce_detection=False, detector_backend=backend, align=alignment_modes[0])
+                results.append((detected_face, emotions))
+            result_queue.put((frame, results))
+        else:
+            result_queue.put((frame, None))
 
-    detected_faces = DeepFace.extract_faces(
-        img_rgb, enforce_detection=False, detector_backend=backend)
+# Thread for processing results and drawing bounding boxes
 
-    print(f"Số khuôn mặt phát hiện được: {len(detected_faces)}")
 
-    if detected_faces is not None and len(detected_faces) > 0:
-        for i, detected_face in enumerate(detected_faces):
-            facial_area = detected_face['facial_area']
-            x, y, w, h = facial_area['x'], facial_area['y'], facial_area['w'], facial_area['h']
+def result_processor(output_path):
+    # Get video properties for output
+    frame_count = 0
+    distance_threshold = 0.6
+    db_path = "test/my_db"
 
-            face_image = detected_face['face']
+    # Create VideoWriter for output
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # Adjust frame size as necessary
+    out = cv2.VideoWriter(output_path, fourcc, 30.0, (640, 480))
 
-            # Nhận diện cảm xúc
-            emotions = DeepFace.analyze(
-                face_image, actions=['emotion'], enforce_detection=False, detector_backend=backend, align=alignment_modes[0])
-            emotion_text = emotions[0]['dominant_emotion'] if emotions else 'Unknown'
+    while True:
+        result = result_queue.get()
+        if result[0] is None:  # Check for end of analysis
+            break
 
-            # So sánh khuôn mặt với dữ liệu trong db
-            results = DeepFace.find(img_path=face_image, db_path=db_path,
-                                    enforce_detection=False, detector_backend=backend, silent=True)
+        frame, detected_faces_results = result
 
-            if results is not None and len(results) > 0:
-                combined_results = pd.concat(results, ignore_index=True)
+        # Process every 5th frame
+        if frame_count % 5 == 0:
+            if detected_faces_results is not None:
+                for detected_face, emotions in detected_faces_results:
+                    facial_area = detected_face['facial_area']
+                    x, y, w, h = facial_area['x'], facial_area['y'], facial_area['w'], facial_area['h']
+                    emotion_text = emotions[0]['dominant_emotion'] if emotions else 'Unknown'
 
-                if not combined_results.empty:
-                    best_match_index = combined_results['distance'].idxmin()
-                    best_result = combined_results.iloc[best_match_index]
+                    # Compare face with database
+                    results = DeepFace.find(
+                        img_path=detected_face['face'], db_path=db_path, enforce_detection=False, detector_backend=backend, silent=True)
 
-                    identity_path = best_result['identity']
-                    identity_path = identity_path.replace("\\", "/")
-                    distance = best_result['distance']
+                    if results and len(results) > 0:
+                        combined_results = pd.concat(
+                            results, ignore_index=True)
 
-                    if distance < distance_threshold:
-                        # Lấy tên từ thư mục
-                        name = identity_path.split("/")[-2]
+                        if not combined_results.empty:
+                            best_match_index = combined_results['distance'].idxmin(
+                            )
+                            best_result = combined_results.iloc[best_match_index]
+                            identity_path = best_result['identity'].replace(
+                                "\\", "/")
+                            distance = best_result['distance']
 
-                        # Truy xuất thông tin từ MongoDB dựa vào tên
-                        user_info = collection.find_one({"name": name})
-
-                        if user_info:
-                            user_text = f"{user_info['name']} - phone: {user_info['phone']}, account_number: {user_info['account_number']}, emotion: {emotion_text}"
-                            print(f"Thông tin người dùng {i+1 }: {user_text}")
-                            draw_bounding_box(
-                                frame, x, y, w, h, f"{str(i+1)}: {user_info['name']} - {emotion_text}")
-                        else:
-                            print(f"Không tìm thấy thông tin cho {name}")
-                            draw_bounding_box(
-                                frame, x, y, w, h, f"{str(i+1)}: {name} - {emotion_text}")
+                            if distance < distance_threshold:
+                                name = identity_path.split("/")[-2]
+                                user_info = collection.find_one({"name": name})
+                                if user_info:
+                                    user_text = f"{user_info['name']} - phone: {user_info['phone']}, account_number: {user_info['account_number']}, emotion: {emotion_text}"
+                                    draw_bounding_box(
+                                        frame, x, y, w, h, f"{name} - {emotion_text}")
+                                else:
+                                    draw_bounding_box(
+                                        frame, x, y, w, h, f"{name} - {emotion_text}")
+                            else:
+                                draw_bounding_box(
+                                    frame, x, y, w, h, f"Unknown - {emotion_text}")
                     else:
                         draw_bounding_box(frame, x, y, w, h,
-                                          f"{str(i+1)} - {emotion_text}")
+                                          f"Unknown - {emotion_text}")
             else:
-                print(f"Khuôn mặt {i+1}: Không tìm thấy kết quả nào.")
-                draw_bounding_box(frame, x, y, w, h,
-                                  f"{str(i+1)} - {emotion_text}")
+                print("No faces detected.")
 
-    out.write(frame)
+        # Write the processed frame to output
+        out.write(frame)
+        frame_count += 1
 
-cap.release()
-out.release()
-cv2.destroyAllWindows()
+    out.release()
+    cv2.destroyAllWindows()
+
+
+# Define video path and output path
+video_path = "Obama_vid.mp4"
+output_path = "output_with_info.mp4"
+
+# Create and start threads
+reader_thread = threading.Thread(target=frame_reader, args=(video_path,))
+analyzer_thread = threading.Thread(target=face_analyzer)
+processor_thread = threading.Thread(
+    target=result_processor, args=(output_path,))
+
+reader_thread.start()
+analyzer_thread.start()
+processor_thread.start()
+
+# Wait for threads to finish
+reader_thread.join()
+analyzer_thread.join()
+processor_thread.join()
 
 print(f"Video đã được lưu thành công vào {output_path}")

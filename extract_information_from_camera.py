@@ -7,26 +7,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Define backends
 backends = [
-    'opencv',
-    'ssd',
-    'dlib',
-    'mtcnn',
-    'fastmtcnn',
-    'retinaface',
-    'mediapipe',
-    'yolov8',
-    'yunet',
-    'centerface',
+    'opencv', 'ssd', 'dlib', 'mtcnn', 'fastmtcnn',
+    'retinaface', 'mediapipe', 'yolov8', 'yunet', 'centerface'
 ]
-backend = backends[7]
+backend = backends[7]  # Use YOLOv8 for face detection
 
 # Connect to MongoDB Atlas
 uri = "mongodb+srv://nguyentrunglam2002:lampro3006@userdata.av8zp.mongodb.net/?retryWrites=true&w=majority&appName=UserData"
 client = MongoClient(uri, server_api=ServerApi('1'))
-db = client["banking"]  # MongoDB database
-collection = db["user_info"]  # MongoDB collection
+db = client["banking"]
+collection = db["user_info"]
 
-# Draw bounding box and display user information
+# Function to draw bounding boxes and display user information
 
 
 def draw_bounding_box(frame, x, y, w, h, text):
@@ -34,20 +26,24 @@ def draw_bounding_box(frame, x, y, w, h, text):
     cv2.putText(frame, text, (x, y - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
 
-# Analyze emotion and match with database
+# Function to analyze face: emotion detection + matching with database
 
 
 def analyze_face(face_image, facial_area, distance_threshold, db_path):
-    emotion_result = DeepFace.analyze(img_path=face_image, actions=[
-                                      'emotion'], enforce_detection=False, detector_backend=backend)
+    # Analyze emotion
+    emotion_result = DeepFace.analyze(
+        img_path=face_image, actions=['emotion'],
+        enforce_detection=False, detector_backend=backend
+    )
+    dominant_emotion = emotion_result[0]['dominant_emotion'] if emotion_result else 'Unknown'
 
-    if emotion_result is not None and len(emotion_result) > 0:
-        dominant_emotion = emotion_result[0]['dominant_emotion']
-        results = DeepFace.find(img_path=face_image, db_path=db_path,
-                                enforce_detection=False, detector_backend=backend, silent=True)
+    # Find face in the database
+    results = DeepFace.find(
+        img_path=face_image, db_path=db_path,
+        enforce_detection=False, detector_backend=backend, silent=True
+    )
 
-        return (facial_area, dominant_emotion, results)
-    return (facial_area, None, None)
+    return (facial_area, dominant_emotion, results)
 
 
 # Using the camera
@@ -67,7 +63,7 @@ while cap.isOpened():
     frame = cv2.resize(frame, (512, 512))
 
     frame_counter += 1
-    if frame_counter % 3 != 0:  # Process every third frame
+    if frame_counter % 10 != 0:  # Process every third frame
         continue
 
     img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -101,22 +97,34 @@ while cap.isOpened():
                             distance = best_result['distance']
 
                             if distance < distance_threshold:
+                                # Get name from folder path
                                 name = identity_path.split("/")[-2]
+                                # Find user info from MongoDB
                                 user_info = collection.find_one({"name": name})
                                 if user_info:
-                                    user_text = f"{user_info['name']} - Emotion: {dominant_emotion}, phone: {user_info['phone']}, account_number: {user_info['account_number']}"
+                                    # Print user information to console
+                                    print(
+                                        f"User: {user_info['name']}, Emotion: {dominant_emotion}, Phone: {user_info['phone']}, Account Number: {user_info['account_number']}")
+                                    # Draw bounding box with text on frame
                                     draw_bounding_box(
-                                        frame, x, y, w, h, f"{name} - {dominant_emotion}")
+                                        frame, x, y, w, h, user_info['name'])
                                 else:
-                                    draw_bounding_box(
-                                        frame, x, y, w, h, f"{name} - {dominant_emotion}")
+                                    print(
+                                        f"User: {name}, Emotion: {dominant_emotion} (Info not found in database)")
+                                    draw_bounding_box(frame, x, y, w, h, name)
                             else:
-                                draw_bounding_box(
-                                    frame, x, y, w, h, f"Unknown - {dominant_emotion}")
+                                print(
+                                    f"Unknown person, Emotion: {dominant_emotion}")
+                                draw_bounding_box(frame, x, y, w, h, "Unknown")
+                        else:
+                            print(
+                                f"Unknown person, Emotion: {dominant_emotion}")
+                            draw_bounding_box(frame, x, y, w, h, "Unknown")
                     else:
-                        draw_bounding_box(frame, x, y, w, h,
-                                          f"Unknown - {dominant_emotion}")
+                        print(f"Unknown person, Emotion: {dominant_emotion}")
+                        draw_bounding_box(frame, x, y, w, h, "Unknown")
 
+    # Display frame
     cv2.imshow('Camera Video', frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
