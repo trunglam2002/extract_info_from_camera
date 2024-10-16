@@ -3,7 +3,9 @@ from deepface import DeepFace
 import pandas as pd
 from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
+import queue
+import threading
 
 # Define backends
 backends = [
@@ -46,88 +48,125 @@ def analyze_face(face_image, facial_area, distance_threshold, db_path):
     return (facial_area, dominant_emotion, results)
 
 
-# Using the camera
-cap = cv2.VideoCapture(0)
+# Initialize queues
+frame_queue = queue.Queue()
+face_queue = queue.Queue()
+result_queue = queue.Queue()
 
-# Distance threshold for identity matching
-distance_threshold = 0.6
-db_path = "test/my_db"
-frame_counter = 0
+# Function to read frames from the camera
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
 
-    # Resize frame to 512x512
-    frame = cv2.resize(frame, (512, 512))
+def camera_reader():
+    cap = cv2.VideoCapture(0)
 
-    frame_counter += 1
-    if frame_counter % 10 != 0:  # Process every third frame
-        continue
+    width = 640
+    height = 480
+    while True:
+        ret, frame = cap.read()
+        if ret:
+            frame = cv2.resize(frame, (width, height))
+            frame_queue.put(frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    cap.release()
 
-    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    detected_faces = DeepFace.extract_faces(
-        img_rgb, enforce_detection=False, detector_backend=backend)
+# Function to extract faces from every nth frame
 
-    if detected_faces is not None and len(detected_faces) > 0:
-        with ThreadPoolExecutor() as executor:
-            futures = []
-            for detected_face in detected_faces:
-                facial_area = detected_face['facial_area']
-                face_image = detected_face['face']
-                futures.append(executor.submit(
-                    analyze_face, face_image, facial_area, distance_threshold, db_path))
 
-            for future in as_completed(futures):
-                facial_area, dominant_emotion, results = future.result()
-                x, y, w, h = facial_area['x'], facial_area['y'], facial_area['w'], facial_area['h']
+def face_extractor():
+    frame_counter = 0
+    while True:
+        frame = frame_queue.get()
+        frame_counter += 1
+        # Process every 10th frame
+        if frame_counter % 10 == 0:
+            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            detected_faces = DeepFace.extract_faces(
+                img_rgb, enforce_detection=False, detector_backend=backend)
+            if detected_faces:
+                for detected_face in detected_faces:
+                    facial_area = detected_face['facial_area']
+                    face_image = detected_face['face']
+                    face_queue.put((face_image, facial_area, frame))
 
-                # Process results
-                if dominant_emotion is not None:
-                    if results is not None and len(results) > 0:
-                        combined_results = pd.concat(
-                            results, ignore_index=True)
-                        if not combined_results.empty:
-                            best_match_index = combined_results['distance'].idxmin(
-                            )
-                            best_result = combined_results.iloc[best_match_index]
-                            identity_path = best_result['identity'].replace(
-                                "\\", "/")
-                            distance = best_result['distance']
+# Function to analyze faces and compare with the database using ThreadPoolExecutor
 
-                            if distance < distance_threshold:
-                                # Get name from folder path
-                                name = identity_path.split("/")[-2]
-                                # Find user info from MongoDB
-                                user_info = collection.find_one({"name": name})
-                                if user_info:
-                                    # Print user information to console
-                                    print(
-                                        f"User: {user_info['name']}, Emotion: {dominant_emotion}, Phone: {user_info['phone']}, Account Number: {user_info['account_number']}")
-                                    # Draw bounding box with text on frame
-                                    draw_bounding_box(
-                                        frame, x, y, w, h, user_info['name'])
-                                else:
-                                    print(
-                                        f"User: {name}, Emotion: {dominant_emotion} (Info not found in database)")
-                                    draw_bounding_box(frame, x, y, w, h, name)
-                            else:
-                                print(
-                                    f"Unknown person, Emotion: {dominant_emotion}")
-                                draw_bounding_box(frame, x, y, w, h, "Unknown")
-                        else:
-                            print(
-                                f"Unknown person, Emotion: {dominant_emotion}")
-                            draw_bounding_box(frame, x, y, w, h, "Unknown")
+
+def face_analyzer():
+    with ThreadPoolExecutor() as executor:
+        while True:
+            face_data = face_queue.get()
+            if face_data:
+                face_image, facial_area, frame = face_data
+                futures = executor.submit(
+                    analyze_face, face_image, facial_area, 0.6, "test/my_db")
+                facial_area, dominant_emotion, results = futures.result()
+                result_queue.put(
+                    (facial_area, dominant_emotion, results, frame))
+
+# Function to lookup MongoDB and display result
+
+
+def mongodb_lookup():
+    while True:
+        facial_area, dominant_emotion, results, frame = result_queue.get()
+
+        # Initialize bounding box variables
+        x, y, w, h = 0, 0, 0, 0  # Default values for no face detected
+
+        # Only set coordinates if facial_area is not None
+        if facial_area is not None:
+            x, y, w, h = facial_area['x'], facial_area['y'], facial_area['w'], facial_area['h']
+
+        # Process results
+        if results is not None and len(results) > 0:
+            combined_results = pd.concat(results, ignore_index=True)
+            if not combined_results.empty:
+                best_match_index = combined_results['distance'].idxmin()
+                best_result = combined_results.iloc[best_match_index]
+                identity_path = best_result['identity'].replace("\\", "/")
+                distance = best_result['distance']
+
+                if distance < 0.6:
+                    # Get name from folder path
+                    name = identity_path.split("/")[-2]
+                    # Find user info from MongoDB
+                    user_info = collection.find_one({"name": name})
+                    if user_info:
+                        print(f"User: {user_info['name']}, Emotion: {dominant_emotion}, "
+                              f"Phone: {user_info['phone']}, Account Number: {user_info['account_number']}")
+                        draw_bounding_box(frame, x, y, w, h, user_info['name'])
                     else:
-                        print(f"Unknown person, Emotion: {dominant_emotion}")
-                        draw_bounding_box(frame, x, y, w, h, "Unknown")
+                        draw_bounding_box(frame, x, y, w, h, name)
+                else:
+                    draw_bounding_box(frame, x, y, w, h, "Unknown")
+            else:
+                draw_bounding_box(frame, x, y, w, h, "Unknown")
+        else:
+            draw_bounding_box(frame, x, y, w, h, "Unknown")
 
-    # Display frame
-    cv2.imshow('Camera Video', frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        # Display the result
+        cv2.imshow('Camera Video', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-cap.release()
+
+# Start threads
+camera_thread = threading.Thread(target=camera_reader)
+extractor_thread = threading.Thread(target=face_extractor)
+analyzer_thread = threading.Thread(target=face_analyzer)
+mongodb_thread = threading.Thread(target=mongodb_lookup)
+
+# Start all threads
+camera_thread.start()
+extractor_thread.start()
+analyzer_thread.start()
+mongodb_thread.start()
+
+# Join threads to ensure they complete
+camera_thread.join()
+extractor_thread.join()
+analyzer_thread.join()
+mongodb_thread.join()
+
 cv2.destroyAllWindows()

@@ -1,4 +1,7 @@
-deepface 
-tf-keras
-ultralytics
+opencv-python
+numpy
+mtcnn
+fer
+keras-facenet
 pymongo
+scikit-learn
