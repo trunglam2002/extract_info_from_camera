@@ -114,11 +114,20 @@ def preprocess_face(face_image, required_size=(160, 160)):
 
 
 def recognize_face(face_encoding):
+    if len(known_face_encodings) == 0:
+        return "Unknown"
+
     similarities = cosine_similarity([face_encoding], known_face_encodings)
     best_match_index = np.argmax(similarities)
-    if similarities[0][best_match_index] > 0.7:  # Adjust threshold as needed
+    best_match_score = similarities[0][best_match_index]
+
+    # Đặt ngưỡng confidence (có thể điều chỉnh giá trị này)
+    SIMILARITY_THRESHOLD = 0.6
+
+    if best_match_score > SIMILARITY_THRESHOLD:
         return known_face_names[best_match_index]
-    return "Unknown"
+    else:
+        return "Unknown"
 
 
 def process_frame(frame):
