@@ -64,10 +64,12 @@ def load_face_database():
             with open("face_database.pkl", "rb") as f:
                 data = pickle.load(f)
                 if isinstance(data, dict):  # Kiểm tra xem dữ liệu có phải là dictionary không
-                    known_face_encodings = list(data.values())  # Gán dữ liệu đã tải
+                    known_face_encodings = list(
+                        data.values())  # Gán dữ liệu đã tải
                     known_face_names = list(data.keys())  # Lấy tên từ các khóa
                 else:
-                    debug_queue.put("Loaded data is not in the expected format (dict).")
+                    debug_queue.put(
+                        "Loaded data is not in the expected format (dict).")
         except Exception as e:
             debug_queue.put(f"Error loading face database: {e}")
     else:
@@ -79,7 +81,8 @@ load_face_database()
 
 def draw_bounding_box(frame, x, y, w, h, text):
     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-    cv2.putText(frame, text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+    cv2.putText(frame, text, (x, y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
 
 def analyze_face(face_image):
@@ -92,7 +95,8 @@ def analyze_face(face_image):
             dominant_emotion = max(emotions_dict, key=emotions_dict.get)
             confidence = emotions_dict[dominant_emotion]
 
-            debug_queue.put(f"Emotion: {emotions[0]['emotions']}, {confidence}")
+            debug_queue.put(
+                f"Emotion: {emotions[0]['emotions']}, {confidence}")
 
             if confidence > 0.3:
                 return dominant_emotion
@@ -130,7 +134,8 @@ def recognize_face(face_encoding):
 
 def process_frame(frame):
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = emotion_detector.find_faces(rgb_frame)  # Sử dụng FER's face detection
+    results = emotion_detector.find_faces(
+        rgb_frame)  # Sử dụng FER's face detection
     for result in results:
         debug_queue.put(result)
         x, y, w, h = result[0], result[1], result[2], result[3]
@@ -153,7 +158,8 @@ def process_frame(frame):
             user_info = collection.find_one({"name": name})
             if user_info:
                 info_text = f"User: {user_info['name']}, Emotion: {emotion}"
-                debug_queue.put(f"{info_text}, Phone: {user_info['phone']}, Account Number: {user_info['account_number']}")
+                debug_queue.put(
+                    f"{info_text}, Phone: {user_info['phone']}, Account Number: {user_info['account_number']}")
             else:
                 info_text = f"{name}, Emotion: {emotion}"
         else:
