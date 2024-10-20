@@ -20,17 +20,14 @@ logger = logging.getLogger(__name__)
 # Tạo queue để lưu trữ thông tin debug
 debug_queue = Queue()
 
+# Tạo queue để thông báo khi mô hình đã được tải
+model_loaded_queue = Queue()
+
 # Connect to MongoDB Atlas
 uri = "mongodb+srv://nguyentrunglam2002:lampro3006@userdata.av8zp.mongodb.net/?retryWrites=true&w=majority&appName=UserData"
 client = MongoClient(uri, server_api=ServerApi('1'))
 db = client["banking"]
 collection = db["user_info"]
-
-# Initialize FER for emotion recognition with face detection
-emotion_detector = FER(mtcnn=False)  # Sử dụng FER's built-in face detection
-
-# Initialize FaceNet
-embedder = FaceNet()
 
 # Frame settings
 FRAME_WIDTH = 640
@@ -42,6 +39,16 @@ recognition_cache = {}
 # Load known face encodings
 known_face_encodings = []
 known_face_names = []
+
+
+def load_models():
+    global emotion_detector, embedder
+    # Initialize FER for emotion recognition with face detection
+    # Sử dụng FER's built-in face detection
+    emotion_detector = FER(mtcnn=False)
+    # Initialize FaceNet
+    embedder = FaceNet()
+    model_loaded_queue.put(True)  # Thông báo rằng mô hình đã được tải
 
 
 def process_debug_info():
@@ -75,6 +82,13 @@ def load_face_database():
     else:
         debug_queue.put("Face database not found. Please create one.")
 
+
+# Khởi động luồng tải mô hình
+model_thread = Thread(target=load_models)
+model_thread.start()
+
+# Đợi cho đến khi mô hình được tải
+model_loaded_queue.get()  # Chờ cho đến khi mô hình được tải xong
 
 load_face_database()
 
