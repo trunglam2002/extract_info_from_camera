@@ -4,7 +4,7 @@ from fer import FER
 from keras_facenet import FaceNet
 from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 import os
 import pickle
@@ -12,16 +12,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 import logging
 from queue import Queue
 from threading import Thread
+from mtcnn import MTCNN
+from tensorflow.keras.models import load_model
+import faiss
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Tạo queue để lưu trữ thông tin debug
-debug_queue = Queue()
-
-# Tạo queue để thông báo khi mô hình đã được tải
-model_loaded_queue = Queue()
 
 # Connect to MongoDB Atlas
 uri = "mongodb+srv://nguyentrunglam2002:lampro3006@userdata.av8zp.mongodb.net/?retryWrites=true&w=majority&appName=UserData"
@@ -39,29 +36,27 @@ recognition_cache = {}
 # Load known face encodings
 known_face_encodings = []
 known_face_names = []
+index = None  # Chỉ mục FAISS
+
+# Khởi tạo MTCNN
+
+
+# Tải mô hình cho anti-spoofing
+model = load_model('model/mobilenetv2-epoch_15.hdf5')
+
+# Biên dịch mô hình với bộ tối ưu và các chỉ số
+model.compile(optimizer='adam', loss='categorical_crossentropy',
+              metrics=['accuracy'])
 
 
 def load_models():
     global emotion_detector, embedder
-    # Initialize FER for emotion recognition with face detection
-    # Sử dụng FER's built-in face detection
+    # Initialize FER for emotion recognition
     emotion_detector = FER(mtcnn=False)
     # Initialize FaceNet
     embedder = FaceNet()
-    model_loaded_queue.put(True)  # Thông báo rằng mô hình đã được tải
 
-
-def process_debug_info():
-    while True:
-        info = debug_queue.get()
-        if info is None:
-            break
-        logger.info(info)
-
-
-# Khởi động thread xử lý debug
-debug_thread = Thread(target=process_debug_info)
-debug_thread.start()
+    # detector = MTCNN()
 
 
 def load_face_database():
@@ -70,56 +65,38 @@ def load_face_database():
         try:
             with open("face_database.pkl", "rb") as f:
                 data = pickle.load(f)
-                if isinstance(data, dict):  # Kiểm tra xem dữ liệu có phải là dictionary không
-                    known_face_encodings = list(
-                        data.values())  # Gán dữ liệu đã tải
-                    known_face_names = list(data.keys())  # Lấy tên từ các khóa
+                if isinstance(data, dict):
+                    # FAISS yêu cầu dữ liệu dạng numpy array
+                    known_face_encodings = np.array(list(data.values()))
+                    known_face_names = list(data.keys())
+                    # Xây dựng chỉ mục FAISS
+                    build_faiss_index(known_face_encodings)
                 else:
-                    debug_queue.put(
+                    logger.error(
                         "Loaded data is not in the expected format (dict).")
         except Exception as e:
-            debug_queue.put(f"Error loading face database: {e}")
+            logger.error(f"Error loading face database: {e}")
     else:
-        debug_queue.put("Face database not found. Please create one.")
+        logger.warning("Face database not found. Please create one.")
 
 
-# Khởi động luồng tải mô hình
-model_thread = Thread(target=load_models)
-model_thread.start()
+def build_faiss_index(face_encodings):
+    global index
+    dimension = face_encodings.shape[1]  # Số chiều của vector encoding
+    index = faiss.IndexFlatL2(dimension)  # Sử dụng L2 distance
+    index.add(face_encodings)  # Thêm tất cả các face encodings vào chỉ mục
 
-# Đợi cho đến khi mô hình được tải
-model_loaded_queue.get()  # Chờ cho đến khi mô hình được tải xong
 
+load_models()
 load_face_database()
 
 
-def draw_bounding_box(frame, x, y, w, h, text):
-    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-    cv2.putText(frame, text, (x, y - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-
-
-def analyze_face(face_image):
-    try:
-        face_image = cv2.resize(face_image, (64, 64))
-        emotions = emotion_detector.detect_emotions(face_image)
-
-        if emotions:
-            emotions_dict = emotions[0]['emotions']
-            dominant_emotion = max(emotions_dict, key=emotions_dict.get)
-            confidence = emotions_dict[dominant_emotion]
-
-            debug_queue.put(
-                f"Emotion: {emotions[0]['emotions']}, {confidence}")
-
-            if confidence > 0.3:
-                return dominant_emotion
-            else:
-                return "Neutral"
-        return "Unknown"
-    except Exception as e:
-        debug_queue.put(f"Error in emotion analysis: {e}")
-        return "Unknown"
+def draw_bounding_box(frame, x, y, w, h, name, emotion, is_real):
+    # Draw bounding box and display info
+    color = (0, 255, 0) if is_real else (0, 0, 255)
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+    cv2.putText(frame, f"{name} | {emotion} | Real: {is_real}",
+                (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
 
 def preprocess_face(face_image, required_size=(160, 160)):
@@ -127,59 +104,106 @@ def preprocess_face(face_image, required_size=(160, 160)):
     return face_image
 
 
-def recognize_face(face_encoding):
+def recognize_face_faiss(face_encoding):
     if len(known_face_encodings) == 0:
         return "Unknown"
 
-    similarities = cosine_similarity([face_encoding], known_face_encodings)
-    best_match_index = np.argmax(similarities)
-    best_match_score = similarities[0][best_match_index]
+    # FAISS tìm kiếm ANN, trả về chỉ số và khoảng cách
+    # Tìm kiếm với top 1 kết quả gần nhất
+    D, I = index.search(np.array([face_encoding]), 1)
 
-    debug_queue.put(f"best_match: {best_match_index}, {best_match_score}")
-
-    # Đặt ngưỡng confidence (có thể điều chỉnh giá trị này)
+    # Ngưỡng để xác định nhận diện có thành công hay không
     SIMILARITY_THRESHOLD = 0.6
-
-    if best_match_score > SIMILARITY_THRESHOLD:
-        return known_face_names[best_match_index]
+    if D[0][0] < SIMILARITY_THRESHOLD:  # FAISS trả về khoảng cách nhỏ hơn là tốt hơn
+        return known_face_names[I[0][0]]  # Trả về tên tương ứng với chỉ số
     else:
         return "Unknown"
 
 
-def process_frame(frame):
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = emotion_detector.find_faces(
-        rgb_frame)  # Sử dụng FER's face detection
-    for result in results:
-        debug_queue.put(result)
-        x, y, w, h = result[0], result[1], result[2], result[3]
-        face_image = rgb_frame[y:y+h, x:x+w]
-        preprocessed_face = preprocess_face(face_image)
-        face_encoding = embedder.embeddings([preprocessed_face])[0]
-
-        face_encoding_bytes = face_encoding.tobytes()
-
-        if face_encoding_bytes in recognition_cache:
-            name, emotion = recognition_cache[face_encoding_bytes]
-        else:
-            name = recognize_face(face_encoding)
-            emotion = analyze_face(face_image)
-            recognition_cache[face_encoding_bytes] = (name, emotion)
-
-        debug_queue.put(f"Final result - Name: {name}, Emotion: {emotion}")
-
-        if name != "Unknown":
-            user_info = collection.find_one({"name": name})
-            if user_info:
-                info_text = f"User: {user_info['name']}, Emotion: {emotion}"
-                debug_queue.put(
-                    f"{info_text}, Phone: {user_info['phone']}, Account Number: {user_info['account_number']}")
+def analyze_face(emotion):
+    try:
+        if isinstance(emotion, dict):  # Check if emotion is a dictionary
+            emo, score = emotion.items(), max(emotion.values())
+            dominant_emotion = max(emotion, key=emotion.get)
+            if score > 0.3:
+                return dominant_emotion
             else:
-                info_text = f"{name}, Emotion: {emotion}"
-        else:
-            info_text = f"Unknown, Emotion: {emotion}"
+                return "Neutral"
+        return "Unknown"
+    except Exception as e:
+        logger.error(f"Error in emotion analysis: {e}")
+        return "Unknown"
 
-        draw_bounding_box(frame, x, y, w, h, info_text)
+
+def anti_spoofing(face_image):
+    # Tiền xử lý khung hình
+    img = cv2.resize(face_image, (224, 224))
+    img = img / 255.0  # Chia cho 255 để chuẩn hóa về [0, 1]
+    img = np.expand_dims(img, axis=0)  # Thêm chiều batch
+
+    # Dự đoán
+    predictions = model.predict(img)
+
+    # Kiểm tra xác suất và gán nhãn dựa trên ngưỡng 0.5
+    return predictions[0][0] > 0.5  # Nhãn True nếu xác suất lớn hơn 0.5 (real)
+
+
+def process_face_detection(frame):
+    # Detect faces
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = emotion_detector.detect_emotions(rgb_frame)
+    return results
+
+
+def process_face_recognition(face_image):
+    preprocessed_face = preprocess_face(face_image)
+    face_encoding = embedder.embeddings([preprocessed_face])[0]
+    # Sử dụng FAISS để nhận diện khuôn mặt
+    name = recognize_face_faiss(face_encoding)
+    return name
+
+
+def process_emotion_detection(emotion):
+    emotion = analyze_face(emotion)
+    return emotion
+
+
+def process_anti_spoofing(face_image):
+    is_real = anti_spoofing(face_image)
+    return is_real
+
+
+def process_frame(frame):
+    results = process_face_detection(frame)
+    with ThreadPoolExecutor() as executor:
+        futures = []
+        face_boxes = []  # Danh sách để lưu trữ thông tin khuôn mặt
+
+        for result in results:
+            x, y, w, h = result['box']
+            face_image = frame[y:y + h, x:x + w]
+
+            # Tạo các tác vụ cho các luồng riêng biệt
+            futures.append(executor.submit(
+                process_face_recognition, face_image))
+            # Đảm bảo truyền đúng dữ liệu
+            futures.append(executor.submit(
+                process_emotion_detection, result['emotions']))
+            futures.append(executor.submit(process_anti_spoofing, face_image))
+
+            # Lưu trữ thông tin khuôn mặt
+            face_boxes.append((x, y, w, h))
+
+        # Gọi hàm `draw_bounding_box` sau khi tất cả các kết quả từ các luồng đều đã hoàn thành
+        for i in range(0, len(futures), 3):
+            name = futures[i].result()
+            emotion = futures[i + 1].result()
+            is_real = futures[i + 2].result()
+
+            # Vẽ chữ cho từng khuôn mặt tại vị trí tương ứng
+            # Lấy thông tin khuôn mặt tương ứng
+            x, y, w, h = face_boxes[i // 3]
+            draw_bounding_box(frame, x, y, w, h, name, emotion, is_real)
 
     return frame
 
@@ -190,24 +214,20 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
     try:
-        with ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    debug_queue.put("Failed to read frame from camera.")
-                    break
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                logger.error("Failed to read frame from camera.")
+                break
 
-                future = executor.submit(process_frame, frame)
-                processed_frame = future.result()
+            # Xử lý frame với các luồng riêng biệt
+            processed_frame = process_frame(frame)
 
-                cv2.imshow('Camera Video', processed_frame)
+            # Hiển thị frame đã xử lý
+            cv2.imshow('Camera Video', processed_frame)
 
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-
-        # Kết thúc thread xử lý debug
-        debug_queue.put(None)
-        debug_thread.join()
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
     finally:
         cap.release()
         cv2.destroyAllWindows()
