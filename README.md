@@ -50,7 +50,7 @@ This application uses face recognition and anti-spoofing technology to detect an
 2. **Stop the Application**: 
    - Press `q` to stop the face recognition application.
   
-# Table of Contents
+# Mục lục
 
 1. [System Requirements](#system-requirements)
 2. [How to Use](#how-to-use)
