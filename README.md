@@ -49,3 +49,11 @@ This application uses face recognition and anti-spoofing technology to detect an
 
 2. **Stop the Application**: 
    - Press `q` to stop the face recognition application.
+  
+# Table of Contents
+
+1. [System Requirements](#system-requirements)
+2. [How to Use](#how-to-use)
+3. [Function Explanations](#function-explanations)
+4. [Creating Threads with ThreadPoolExecutor](#creating-threads-with-threadpoolexecutor)
+5. [Operational Diagram](#operational-diagram)
