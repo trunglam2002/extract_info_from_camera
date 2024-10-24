@@ -1,7 +1,9 @@
-opencv-python
-numpy
-fer
-keras-facenet
-pymongo
-scikit-learn
-tensorflow
+opencv-python>=4.5.1
+numpy>=1.19.5
+fer>=0.8.0
+keras-facenet>=0.3.0
+pymongo>=3.11.3
+concurrent.futures>=3.1.1  # Chỉ cần nếu bạn dùng Python < 3.2
+mtcnn>=0.1.0
+tensorflow>=2.4.0
+faiss-cpu>=1.7.1

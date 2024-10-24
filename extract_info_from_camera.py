@@ -4,21 +4,27 @@ from fer import FER
 from keras_facenet import FaceNet
 from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 import os
 import pickle
-from sklearn.metrics.pairwise import cosine_similarity
 import logging
-from queue import Queue
-from threading import Thread
 from mtcnn import MTCNN
 from tensorflow.keras.models import load_model
 import faiss
+from typing import Sequence, Tuple
+import tensorflow as tf
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Check for GPU
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    tf.config.experimental.set_memory_growth(physical_devices[0], True)
+    logger.info("GPU is available and will be used.")
+else:
+    logger.info("No GPU found. Using CPU.")
 
 # Connect to MongoDB Atlas
 uri = "mongodb+srv://nguyentrunglam2002:lampro3006@userdata.av8zp.mongodb.net/?retryWrites=true&w=majority&appName=UserData"
@@ -39,7 +45,7 @@ known_face_names = []
 index = None  # Chỉ mục FAISS
 
 # Khởi tạo MTCNN
-
+detector = MTCNN()
 
 # Tải mô hình cho anti-spoofing
 model = load_model('model/mobilenetv2-epoch_15.hdf5')
@@ -55,8 +61,6 @@ def load_models():
     emotion_detector = FER(mtcnn=False)
     # Initialize FaceNet
     embedder = FaceNet()
-
-    # detector = MTCNN()
 
 
 def load_face_database():
@@ -100,6 +104,11 @@ def draw_bounding_box(frame, x, y, w, h, name, emotion, is_real):
 
 
 def preprocess_face(face_image, required_size=(160, 160)):
+    # Check if the face_image is valid
+    if face_image is None or face_image.size == 0:
+        logger.error("Empty face image provided for preprocessing.")
+        return None
+
     face_image = cv2.resize(face_image, required_size)
     return face_image
 
@@ -120,11 +129,15 @@ def recognize_face_faiss(face_encoding):
         return "Unknown"
 
 
-def analyze_face(emotion):
+def analyze_face(frame, sequence_coordinate):
+    # Detect emotions using pre-detected face rectangles
+    emotions = emotion_detector.detect_emotions(
+        frame, face_rectangles=sequence_coordinate)
     try:
-        if isinstance(emotion, dict):  # Check if emotion is a dictionary
-            emo, score = emotion.items(), max(emotion.values())
-            dominant_emotion = max(emotion, key=emotion.get)
+        if emotions:  # Check if any emotions are detected
+            dominant_emotion = max(
+                emotions[0]['emotions'], key=emotions[0]['emotions'].get)
+            score = emotions[0]['emotions'][dominant_emotion]
             if score > 0.3:
                 return dominant_emotion
             else:
@@ -145,13 +158,13 @@ def anti_spoofing(face_image):
     predictions = model.predict(img)
 
     # Kiểm tra xác suất và gán nhãn dựa trên ngưỡng 0.5
-    return predictions[0][0] > 0.5  # Nhãn True nếu xác suất lớn hơn 0.5 (real)
+    return predictions[0][0] < 0.5  # Nhãn True nếu xác suất lớn hơn 0.5 (real)
 
 
 def process_face_detection(frame):
     # Detect faces
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = emotion_detector.detect_emotions(rgb_frame)
+    results = detector.detect_faces(rgb_frame)
     return results
 
 
@@ -163,8 +176,8 @@ def process_face_recognition(face_image):
     return name
 
 
-def process_emotion_detection(emotion):
-    emotion = analyze_face(emotion)
+def process_emotion_detection(frame, sequence_coordinate):
+    emotion = analyze_face(frame, sequence_coordinate)
     return emotion
 
 
@@ -173,45 +186,69 @@ def process_anti_spoofing(face_image):
     return is_real
 
 
-def process_frame(frame):
+def query_user_info(name):
+    user_info = collection.find_one({"name": name})  # Truy vấn theo tên
+    if user_info:
+        return user_info  # Trả về thông tin người dùng
+    else:
+        return None  # Không tìm thấy người dùng
+
+
+def preprocess_coordinate(x, y, w, h):
+    face_rectangles: Sequence[Tuple[int, int, int, int]] = []
+    # Thêm hình chữ nhật vào danh sách
+    face_rectangles.append((x, y, w, h))  # Thêm tuple (x, y, w, h)
+    return face_rectangles
+
+
+def process_frame(frame, frame_count, skip_frames=5, previous_faces=None):
+    if previous_faces is None:
+        previous_faces = []
+
+    if frame_count % skip_frames != 0:
+        # Draw previous bounding boxes
+        for (x, y, w, h, name, emotion, is_real) in previous_faces:
+            draw_bounding_box(frame, x, y, w, h, name, emotion, is_real)
+        return frame, previous_faces
+
     results = process_face_detection(frame)
-    with ThreadPoolExecutor() as executor:
+    current_faces = []
+
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
         futures = []
-        face_boxes = []  # Danh sách để lưu trữ thông tin khuôn mặt
+        face_boxes = []
 
         for result in results:
             x, y, w, h = result['box']
             face_image = frame[y:y + h, x:x + w]
-
-            # Tạo các tác vụ cho các luồng riêng biệt
+            sequence_coordinate = preprocess_coordinate(x, y, w, h)
             futures.append(executor.submit(
                 process_face_recognition, face_image))
-            # Đảm bảo truyền đúng dữ liệu
             futures.append(executor.submit(
-                process_emotion_detection, result['emotions']))
+                process_emotion_detection, frame, sequence_coordinate))
             futures.append(executor.submit(process_anti_spoofing, face_image))
-
-            # Lưu trữ thông tin khuôn mặt
             face_boxes.append((x, y, w, h))
 
-        # Gọi hàm `draw_bounding_box` sau khi tất cả các kết quả từ các luồng đều đã hoàn thành
         for i in range(0, len(futures), 3):
             name = futures[i].result()
             emotion = futures[i + 1].result()
             is_real = futures[i + 2].result()
-
-            # Vẽ chữ cho từng khuôn mặt tại vị trí tương ứng
-            # Lấy thông tin khuôn mặt tương ứng
+            user_info = query_user_info(name)
+            if user_info:
+                logger.info(f"User Info: {user_info}")
             x, y, w, h = face_boxes[i // 3]
             draw_bounding_box(frame, x, y, w, h, name, emotion, is_real)
+            current_faces.append((x, y, w, h, name, emotion, is_real))
 
-    return frame
+    return frame, current_faces
 
 
 def main():
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    frame_count = 0
+    previous_faces = []
 
     try:
         while True:
@@ -220,14 +257,14 @@ def main():
                 logger.error("Failed to read frame from camera.")
                 break
 
-            # Xử lý frame với các luồng riêng biệt
-            processed_frame = process_frame(frame)
-
-            # Hiển thị frame đã xử lý
+            processed_frame, previous_faces = process_frame(
+                frame, frame_count, previous_faces=previous_faces)
             cv2.imshow('Camera Video', processed_frame)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
+
+            frame_count += 1
     finally:
         cap.release()
         cv2.destroyAllWindows()
